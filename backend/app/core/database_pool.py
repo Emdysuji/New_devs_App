@@ -1,6 +1,5 @@
 import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.pool import QueuePool
 import logging
 from ..config import settings
 
@@ -15,11 +14,20 @@ class DatabasePool:
         """Initialize database connection pool"""
         try:
             # Create async engine with connection pooling
-            database_url = f"postgresql+asyncpg://{settings.supabase_db_user}:{settings.supabase_db_password}@{settings.supabase_db_host}:{settings.supabase_db_port}/{settings.supabase_db_name}"
+            # FIX: the old URL used settings.supabase_db_* fields that do not exist, so the pool
+            # never started and the API silently served mock data. Use DATABASE_URL instead.
+            database_url = settings.database_url
+            if database_url.startswith("postgres://"):
+                database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+            elif database_url.startswith("postgresql://"):
+                database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+            elif database_url.startswith("postgresql+psycopg2://"):
+                database_url = database_url.replace("postgresql+psycopg2://", "postgresql+asyncpg://", 1)
             
             self.engine = create_async_engine(
                 database_url,
-                poolclass=QueuePool,
+                # FIX: QueuePool cannot be used with an asyncio engine (raises ArgumentError).
+                # The default pool for async engines is used instead.
                 pool_size=20,  # Number of connections to maintain
                 max_overflow=30,  # Additional connections when needed
                 pool_pre_ping=True,  # Validate connections
@@ -45,7 +53,7 @@ class DatabasePool:
         if self.engine:
             await self.engine.dispose()
     
-    async def get_session(self) -> AsyncSession:
+    def get_session(self) -> AsyncSession:
         """Get database session from pool"""
         if not self.session_factory:
             raise Exception("Database pool not initialized")
@@ -54,7 +62,9 @@ class DatabasePool:
 # Global database pool instance
 db_pool = DatabasePool()
 
-async def get_db_session() -> AsyncSession:
-    """Dependency to get database session"""
+async def get_db_session():
+    """FastAPI dependency that yields a session from the shared pool."""
+    if not db_pool.session_factory:
+        await db_pool.initialize()
     async with db_pool.get_session() as session:
         yield session
